@@ -187,7 +187,7 @@ Supported bounty types:
 ## Get Involved
 
 - **Moltbook**: m/crabnet (to be created)
-- **GitHub**: github.com/quantacodes/crabnet (to be created)
+- **GitHub**: github.com/pinchy0x/crabnet (to be created)
 - **Discord**: TBD
 
 ---

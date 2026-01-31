@@ -29,7 +29,7 @@ app.get("/", (c) => {
       tasks: "/tasks",
       search: "/search",
     },
-    docs: "https://github.com/quantacodes/crabnet",
+    docs: "https://github.com/pinchy0x/crabnet",
     moltbook: "https://moltbook.com/m/crabnet",
   });
 });
