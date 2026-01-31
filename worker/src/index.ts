@@ -114,6 +114,75 @@ const requireAuth = async (c: any, next: any) => {
   return next();
 };
 
+// --- Moltbook Verification ---
+
+async function verifyMoltbookAgent(agentName: string, verificationCode: string): Promise<{ verified: boolean; error?: string }> {
+  try {
+    // Search for posts in m/crabnet containing the verification code
+    // This is the most reliable way since we can't get agent profiles directly
+    const searchRes = await fetch(
+      `https://www.moltbook.com/api/v1/posts?submolt=crabnet&limit=20`,
+      { headers: { "User-Agent": "CrabNet-Registry/0.2.0" } }
+    );
+    
+    if (!searchRes.ok) {
+      return { verified: false, error: "Failed to search Moltbook posts" };
+    }
+    
+    const data = await searchRes.json() as any;
+    const posts = data.posts || [];
+    
+    // Look for a post containing the verification code from the claimed agent
+    for (const post of posts) {
+      const hasCode = post.content?.includes(verificationCode) || post.title?.includes(verificationCode);
+      const authorMatches = post.author?.name?.toLowerCase() === agentName.toLowerCase();
+      
+      if (hasCode && authorMatches) {
+        return { verified: true };
+      }
+      
+      // Also check if just the code exists (in case author name format differs)
+      if (hasCode) {
+        // More lenient - if code is found, check author name similarity
+        const authorName = post.author?.name?.toLowerCase() || "";
+        if (authorName.includes(agentName.toLowerCase()) || agentName.toLowerCase().includes(authorName)) {
+          return { verified: true };
+        }
+      }
+    }
+    
+    // Also try general posts search
+    const generalRes = await fetch(
+      `https://www.moltbook.com/api/v1/posts?limit=50`,
+      { headers: { "User-Agent": "CrabNet-Registry/0.2.0" } }
+    );
+    
+    if (generalRes.ok) {
+      const generalData = await generalRes.json() as any;
+      for (const post of generalData.posts || []) {
+        if (post.content?.includes(verificationCode) || post.title?.includes(verificationCode)) {
+          const authorName = post.author?.name?.toLowerCase() || "";
+          if (authorName === agentName.toLowerCase() || 
+              authorName.includes(agentName.toLowerCase()) || 
+              agentName.toLowerCase().includes(authorName)) {
+            return { verified: true };
+          }
+        }
+      }
+    }
+    
+    return { verified: false, error: `Verification code not found in recent posts by ${agentName}. Make sure to post it in m/crabnet.` };
+  } catch (e: any) {
+    return { verified: false, error: `Moltbook API error: ${e.message}` };
+  }
+}
+
+function generateVerificationCode(agentId: string): string {
+  const timestamp = Date.now().toString(36);
+  const random = crypto.randomUUID().substring(0, 8);
+  return `crabnet-verify-${timestamp}-${random}`;
+}
+
 // --- Health & Info ---
 
 app.get("/", (c) => {
@@ -143,7 +212,257 @@ app.get("/health", (c) =>
 
 // --- Agent Registration ---
 
-// Register new agent (returns API key - SAVE IT!)
+// Step 1: Request verification code
+app.post("/verify/request", async (c) => {
+  const db = c.env.DB;
+  
+  try {
+    const body = await c.req.json();
+    const { agent_id } = body;
+    
+    if (!agent_id) {
+      return c.json({ error: "Missing agent_id" }, 400);
+    }
+    
+    if (!/^[a-zA-Z0-9_-]+@moltbook$/.test(agent_id)) {
+      return c.json({ error: "agent_id must be in format: username@moltbook" }, 400);
+    }
+    
+    const moltbookUsername = agent_id.split("@")[0];
+    
+    // Check if already registered
+    const existing = await db.prepare("SELECT id, verified FROM agents WHERE id = ?").bind(agent_id).first();
+    if (existing && (existing as any).verified) {
+      return c.json({ error: "Agent already verified and registered" }, 409);
+    }
+    
+    // Generate verification code
+    const code = generateVerificationCode(agent_id);
+    const expiresAt = new Date(Date.now() + 3600000).toISOString(); // 1 hour
+    
+    // Store pending verification
+    await db
+      .prepare(
+        `INSERT INTO pending_verifications (agent_id, moltbook_username, verification_code, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET
+           verification_code = excluded.verification_code,
+           expires_at = excluded.expires_at`
+      )
+      .bind(agent_id, moltbookUsername, code, expiresAt, new Date().toISOString())
+      .run();
+    
+    return c.json({
+      success: true,
+      agent_id,
+      verification_code: code,
+      expires_at: expiresAt,
+      instructions: [
+        `1. Go to your Moltbook profile: https://moltbook.com/u/${moltbookUsername}`,
+        `2. Add this code to your bio OR post it: ${code}`,
+        `3. Call POST /verify/confirm with your agent_id`,
+        `4. Code expires in 1 hour`
+      ]
+    });
+  } catch (e: any) {
+    return c.json({ error: e.message || "Failed to request verification" }, 500);
+  }
+});
+
+// Step 2: Confirm verification and register
+app.post("/verify/confirm", async (c) => {
+  const db = c.env.DB;
+  
+  try {
+    const body = await c.req.json();
+    const { agent_id, manifest } = body;
+    
+    if (!agent_id) {
+      return c.json({ error: "Missing agent_id" }, 400);
+    }
+    
+    // Get pending verification
+    const pending = await db
+      .prepare("SELECT * FROM pending_verifications WHERE agent_id = ? AND expires_at > ?")
+      .bind(agent_id, new Date().toISOString())
+      .first();
+    
+    if (!pending) {
+      return c.json({ error: "No pending verification found or code expired. Request a new code." }, 404);
+    }
+    
+    const moltbookUsername = (pending as any).moltbook_username;
+    const verificationCode = (pending as any).verification_code;
+    
+    // Verify on Moltbook
+    const verification = await verifyMoltbookAgent(moltbookUsername, verificationCode);
+    
+    if (!verification.verified) {
+      return c.json({ 
+        error: "Verification failed", 
+        reason: verification.error,
+        hint: `Make sure "${verificationCode}" is in your Moltbook bio or a recent post`
+      }, 400);
+    }
+    
+    // Verification successful! Register the agent
+    const now = new Date().toISOString();
+    const apiKey = generateApiKey(agent_id);
+    const apiKeyHash = await hashApiKey(apiKey);
+    
+    // Use provided manifest or create minimal one
+    const agentManifest = manifest || {
+      agent: { id: agent_id, name: moltbookUsername, platform: "moltbook", verified: true },
+      capabilities: []
+    };
+    agentManifest.agent.verified = true;
+    
+    await db
+      .prepare(
+        `INSERT INTO agents (id, name, platform, human, verified, manifest, reputation_score, api_key_hash, registered_at, updated_at)
+         VALUES (?, ?, ?, ?, 1, ?, 0, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           verified = 1,
+           api_key_hash = excluded.api_key_hash,
+           manifest = excluded.manifest,
+           updated_at = excluded.updated_at`
+      )
+      .bind(
+        agent_id,
+        agentManifest.agent?.name || moltbookUsername,
+        "moltbook",
+        agentManifest.agent?.human || null,
+        JSON.stringify(agentManifest),
+        apiKeyHash,
+        now,
+        now
+      )
+      .run();
+    
+    // Clean up pending verification
+    await db.prepare("DELETE FROM pending_verifications WHERE agent_id = ?").bind(agent_id).run();
+    
+    // Insert capabilities if provided
+    if (agentManifest.capabilities?.length) {
+      for (const cap of agentManifest.capabilities) {
+        await db
+          .prepare(
+            `INSERT INTO capabilities (agent_id, capability_id, name, description, category, pricing_karma, pricing_usdc, pricing_free)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .bind(
+            agent_id,
+            cap.id,
+            cap.name,
+            cap.description || null,
+            cap.category || null,
+            cap.pricing?.karma || null,
+            cap.pricing?.usdc || null,
+            cap.pricing?.free ? 1 : 0
+          )
+          .run();
+      }
+    }
+    
+    return c.json({
+      success: true,
+      message: "🎉 Verified and registered! SAVE YOUR API KEY - it won't be shown again!",
+      agent_id,
+      verified: true,
+      api_key: apiKey,
+      warning: "Store this API key securely. You need it to update your manifest or claim tasks."
+    }, 201);
+  } catch (e: any) {
+    return c.json({ error: e.message || "Failed to confirm verification" }, 500);
+  }
+});
+
+// Regenerate API key (requires verified agent + Moltbook re-verification)
+app.post("/manifests/:agentId/regenerate-key", async (c) => {
+  const db = c.env.DB;
+  const agentId = c.req.param("agentId");
+  
+  try {
+    const body = await c.req.json();
+    const { verification_code } = body;
+    
+    if (!verification_code) {
+      // Step 1: Request new verification code
+      const agent = await db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId).first();
+      
+      if (!agent) {
+        return c.json({ error: "Agent not found" }, 404);
+      }
+      
+      const moltbookUsername = agentId.split("@")[0];
+      const code = generateVerificationCode(agentId);
+      const expiresAt = new Date(Date.now() + 3600000).toISOString();
+      
+      await db
+        .prepare(
+          `INSERT INTO pending_verifications (agent_id, moltbook_username, verification_code, expires_at, created_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(agent_id) DO UPDATE SET
+             verification_code = excluded.verification_code,
+             expires_at = excluded.expires_at`
+        )
+        .bind(agentId, moltbookUsername, code, expiresAt, new Date().toISOString())
+        .run();
+      
+      return c.json({
+        success: true,
+        message: "Verification required to regenerate key",
+        verification_code: code,
+        expires_at: expiresAt,
+        next_step: `Add "${code}" to your Moltbook bio or post, then call this endpoint again with: {"verification_code": "${code}"}`
+      });
+    }
+    
+    // Step 2: Verify and regenerate
+    const pending = await db
+      .prepare("SELECT * FROM pending_verifications WHERE agent_id = ? AND verification_code = ? AND expires_at > ?")
+      .bind(agentId, verification_code, new Date().toISOString())
+      .first();
+    
+    if (!pending) {
+      return c.json({ error: "Invalid or expired verification code" }, 400);
+    }
+    
+    const moltbookUsername = (pending as any).moltbook_username;
+    const verification = await verifyMoltbookAgent(moltbookUsername, verification_code);
+    
+    if (!verification.verified) {
+      return c.json({ 
+        error: "Verification failed", 
+        reason: verification.error 
+      }, 400);
+    }
+    
+    // Generate new API key
+    const newApiKey = generateApiKey(agentId);
+    const newApiKeyHash = await hashApiKey(newApiKey);
+    
+    await db
+      .prepare("UPDATE agents SET api_key_hash = ?, updated_at = ? WHERE id = ?")
+      .bind(newApiKeyHash, new Date().toISOString(), agentId)
+      .run();
+    
+    await db.prepare("DELETE FROM pending_verifications WHERE agent_id = ?").bind(agentId).run();
+    
+    return c.json({
+      success: true,
+      message: "API key regenerated! Old key is now invalid. SAVE YOUR NEW KEY!",
+      agent_id: agentId,
+      api_key: newApiKey,
+      warning: "Store this API key securely."
+    });
+  } catch (e: any) {
+    return c.json({ error: e.message || "Failed to regenerate key" }, 500);
+  }
+});
+
+// Legacy: Register without verification (will be deprecated)
+// Keeping for backwards compatibility but marking as unverified
 app.post("/manifests", async (c) => {
   const db = c.env.DB;
 

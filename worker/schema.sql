@@ -72,6 +72,15 @@ CREATE TABLE IF NOT EXISTS rate_limits (
   timestamp INTEGER NOT NULL
 );
 
+-- Pending verifications table
+CREATE TABLE IF NOT EXISTS pending_verifications (
+  agent_id TEXT PRIMARY KEY,
+  moltbook_username TEXT NOT NULL,
+  verification_code TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 -- Indexes for fast queries
 CREATE INDEX IF NOT EXISTS idx_agents_api_key ON agents(api_key_hash);
 CREATE INDEX IF NOT EXISTS idx_agents_reputation ON agents(reputation_score DESC);
