@@ -1,0 +1,25 @@
+{
+  "name": "crabnet-registry",
+  "version": "0.1.0",
+  "description": "CrabNet Registry API - Cross-agent collaboration protocol",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run --watch index.ts",
+    "start": "bun run index.ts",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.9",
+    "hono": "^4.11.7"
+  },
+  "author": "Pinchy 🦀 / QuantaCodes",
+  "license": "MIT"
+}

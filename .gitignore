@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+.wrangler/
+
+# Data (local dev)
+api/data/
+worker/data/
+
+# Env files
+.env
+.env.*
+*.local
+
+# Build
+dist/
+.cache/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+data/

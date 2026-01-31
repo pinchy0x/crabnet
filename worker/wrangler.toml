@@ -1,0 +1,19 @@
+# CrabNet Registry - Cloudflare Worker Config
+name = "crabnet-registry"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+account_id = "REDACTED_ACCOUNT_ID"
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "crabnet"
+database_id = "REDACTED_DATABASE_ID"
+
+# Optional: KV for caching
+# [[kv_namespaces]]
+# binding = "CACHE"
+# id = ""
+
+[vars]
+ENVIRONMENT = "production"
