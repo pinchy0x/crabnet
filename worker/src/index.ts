@@ -265,7 +265,7 @@ app.post("/verify/request", async (c) => {
       ]
     });
   } catch (e: any) {
-    return c.json({ error: e.message || "Failed to request verification" }, 500);
+    return c.json({ error: "Failed to request verification" }, 500);
   }
 });
 
@@ -373,7 +373,7 @@ app.post("/verify/confirm", async (c) => {
       warning: "Store this API key securely. You need it to update your manifest or claim tasks."
     }, 201);
   } catch (e: any) {
-    return c.json({ error: e.message || "Failed to confirm verification" }, 500);
+    return c.json({ error: "Failed to confirm verification" }, 500);
   }
 });
 
@@ -457,7 +457,7 @@ app.post("/manifests/:agentId/regenerate-key", async (c) => {
       warning: "Store this API key securely."
     });
   } catch (e: any) {
-    return c.json({ error: e.message || "Failed to regenerate key" }, 500);
+    return c.json({ error: "Failed to regenerate key" }, 500);
   }
 });
 
@@ -559,7 +559,7 @@ app.post("/manifests", async (c) => {
     );
   } catch (e: any) {
     console.error("Registration error:", e);
-    return c.json({ error: e.message || "Failed to register manifest" }, 500);
+    return c.json({ error: "Failed to register manifest" }, 500);
   }
 });
 
@@ -629,7 +629,7 @@ app.put("/manifests/:agentId", requireAuth, async (c) => {
 
     return c.json({ success: true, message: "Manifest updated 🦀" });
   } catch (e: any) {
-    return c.json({ error: e.message || "Failed to update manifest" }, 500);
+    return c.json({ error: "Failed to update manifest" }, 500);
   }
 });
 
@@ -868,7 +868,7 @@ app.post("/tasks", requireAuth, async (c) => {
       201
     );
   } catch (e: any) {
-    return c.json({ error: e.message || "Failed to create task" }, 500);
+    return c.json({ error: "Failed to create task" }, 500);
   }
 });
 
@@ -1011,7 +1011,7 @@ app.post("/tasks/:taskId/deliver", requireAuth, async (c) => {
 
     return c.json({ success: true, message: "Result delivered! Awaiting verification 🦀" });
   } catch (e: any) {
-    return c.json({ error: e.message || "Failed to deliver result" }, 500);
+    return c.json({ error: "Failed to deliver result" }, 500);
   }
 });
 
@@ -1066,7 +1066,541 @@ app.post("/tasks/:taskId/verify", requireAuth, async (c) => {
       status: newStatus,
     });
   } catch (e: any) {
-    return c.json({ error: e.message || "Failed to verify task" }, 500);
+    return c.json({ error: "Failed to verify task" }, 500);
+  }
+});
+
+// --- Vouch System (Phase 2) ---
+
+// Give a vouch to another agent
+app.post("/agents/:agentId/vouch", requireAuth, async (c) => {
+  const db = c.env.DB;
+  const voucheeId = c.req.param("agentId");
+  const voucherId = c.get("agentId");
+  const now = new Date().toISOString();
+
+  // Can't vouch for self
+  if (voucheeId === voucherId) {
+    return c.json({ error: "Cannot vouch for yourself" }, 400);
+  }
+
+  try {
+    const body = await c.req.json();
+    const strength = Math.min(Math.max(body.strength || 50, 1), 100);
+    const message = body.message || null;
+    const category = body.category || null;
+    const expiresInDays = body.expires_in_days;
+    const expiresAt = expiresInDays 
+      ? new Date(Date.now() + expiresInDays * 86400000).toISOString() 
+      : null;
+
+    // Check vouchee exists
+    const vouchee = await db.prepare("SELECT id, reputation_score FROM agents WHERE id = ?").bind(voucheeId).first();
+    if (!vouchee) {
+      return c.json({ error: "Agent not found" }, 404);
+    }
+
+    // Check voucher reputation and account age
+    const voucher = await db.prepare(
+      "SELECT reputation_score, verified, registered_at FROM agents WHERE id = ?"
+    ).bind(voucherId).first();
+    
+    if ((voucher as any)?.reputation_score < 10) {
+      return c.json({ error: "You need at least 10 reputation to vouch for others" }, 403);
+    }
+
+    // Prevent sock puppet attacks - require 24h account age
+    const hoursSinceRegistration = (Date.now() - new Date((voucher as any).registered_at).getTime()) / 3600000;
+    if (hoursSinceRegistration < 24) {
+      return c.json({ error: "Account must be at least 24 hours old to vouch" }, 403);
+    }
+
+    // Daily vouch limit (10 per day)
+    const todayStart = new Date();
+    todayStart.setUTCHours(0, 0, 0, 0);
+    const vouchesToday = await db.prepare(
+      `SELECT COUNT(*) as count FROM vouches 
+       WHERE voucher_id = ? AND created_at >= ?`
+    ).bind(voucherId, todayStart.toISOString()).first();
+
+    if ((vouchesToday as any)?.count >= 10) {
+      return c.json({ error: "Daily vouch limit reached (10/day)" }, 429);
+    }
+
+    // Check for existing active vouch
+    const existingVouch = await db
+      .prepare("SELECT id FROM vouches WHERE voucher_id = ? AND vouchee_id = ? AND revoked_at IS NULL")
+      .bind(voucherId, voucheeId)
+      .first();
+
+    const vouchId = existingVouch ? (existingVouch as any).id : crypto.randomUUID();
+
+    if (existingVouch) {
+      // Update existing vouch
+      await db
+        .prepare(
+          `UPDATE vouches SET strength = ?, message = ?, category = ?, expires_at = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .bind(strength, message, category, expiresAt, now, vouchId)
+        .run();
+    } else {
+      // Create new vouch
+      await db
+        .prepare(
+          `INSERT INTO vouches (id, voucher_id, vouchee_id, strength, message, category, created_at, updated_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(vouchId, voucherId, voucheeId, strength, message, category, now, now, expiresAt)
+        .run();
+
+      // Update vouch counts
+      await db.prepare("UPDATE agents SET vouch_count = vouch_count + 1 WHERE id = ?").bind(voucherId).run();
+      await db.prepare("UPDATE agents SET vouched_by_count = vouched_by_count + 1 WHERE id = ?").bind(voucheeId).run();
+    }
+
+    // Recalculate vouchee reputation
+    const newReputation = await calculateReputation(db, voucheeId);
+    await db
+      .prepare("UPDATE agents SET reputation_score = ?, reputation_updated_at = ?, last_activity_at = ? WHERE id = ?")
+      .bind(newReputation, now, now, voucheeId)
+      .run();
+
+    // Update voucher activity
+    await db.prepare("UPDATE agents SET last_activity_at = ? WHERE id = ?").bind(now, voucherId).run();
+
+    return c.json({
+      success: true,
+      vouch: {
+        id: vouchId,
+        voucher: voucherId,
+        vouchee: voucheeId,
+        strength,
+        message,
+        category,
+        created_at: now,
+        expires_at: expiresAt,
+      },
+      vouchee_new_reputation: newReputation,
+    }, existingVouch ? 200 : 201);
+  } catch (e: any) {
+    return c.json({ error: "Failed to create vouch" }, 500);
+  }
+});
+
+// Revoke a vouch
+app.delete("/agents/:agentId/vouch", requireAuth, async (c) => {
+  const db = c.env.DB;
+  const voucheeId = c.req.param("agentId");
+  const voucherId = c.get("agentId");
+  const now = new Date().toISOString();
+
+  try {
+    // Find and revoke the vouch
+    const result = await db
+      .prepare(
+        `UPDATE vouches SET revoked_at = ? 
+         WHERE voucher_id = ? AND vouchee_id = ? AND revoked_at IS NULL`
+      )
+      .bind(now, voucherId, voucheeId)
+      .run();
+
+    if (!result.meta.changes) {
+      return c.json({ error: "No active vouch found to revoke" }, 404);
+    }
+
+    // Update vouch counts
+    await db.prepare("UPDATE agents SET vouch_count = MAX(0, vouch_count - 1) WHERE id = ?").bind(voucherId).run();
+    await db.prepare("UPDATE agents SET vouched_by_count = MAX(0, vouched_by_count - 1) WHERE id = ?").bind(voucheeId).run();
+
+    // Recalculate vouchee reputation
+    const newReputation = await calculateReputation(db, voucheeId);
+    await db
+      .prepare("UPDATE agents SET reputation_score = ?, reputation_updated_at = ? WHERE id = ?")
+      .bind(newReputation, now, voucheeId)
+      .run();
+
+    return c.json({
+      success: true,
+      message: "Vouch revoked",
+      vouchee_new_reputation: newReputation,
+    });
+  } catch (e: any) {
+    return c.json({ error: "Failed to revoke vouch" }, 500);
+  }
+});
+
+// Get vouches for an agent
+app.get("/agents/:agentId/vouches", async (c) => {
+  const db = c.env.DB;
+  const agentId = c.req.param("agentId");
+  const direction = c.req.query("direction") || "received"; // given or received
+  const activeOnly = c.req.query("active") !== "false";
+
+  try {
+    let query: string;
+    let bindParam: string;
+
+    if (direction === "given") {
+      query = `SELECT v.*, a.name as agent_name, a.reputation_score, a.verified
+               FROM vouches v
+               JOIN agents a ON v.vouchee_id = a.id
+               WHERE v.voucher_id = ?`;
+      bindParam = agentId;
+    } else {
+      query = `SELECT v.*, a.name as agent_name, a.reputation_score, a.verified
+               FROM vouches v
+               JOIN agents a ON v.voucher_id = a.id
+               WHERE v.vouchee_id = ?`;
+      bindParam = agentId;
+    }
+
+    if (activeOnly) {
+      query += ` AND v.revoked_at IS NULL AND (v.expires_at IS NULL OR v.expires_at > datetime('now'))`;
+    }
+
+    query += " ORDER BY v.created_at DESC";
+
+    const results = await db.prepare(query).bind(bindParam).all();
+
+    return c.json({
+      agent_id: agentId,
+      direction,
+      count: results.results?.length || 0,
+      vouches: results.results?.map((v: any) => ({
+        id: v.id,
+        [direction === "given" ? "vouchee" : "voucher"]: {
+          id: direction === "given" ? v.vouchee_id : v.voucher_id,
+          name: v.agent_name,
+          reputation: v.reputation_score,
+          verified: !!v.verified,
+        },
+        strength: v.strength,
+        message: v.message,
+        category: v.category,
+        created_at: v.created_at,
+        expires_at: v.expires_at,
+        revoked_at: v.revoked_at,
+      })),
+    });
+  } catch (e: any) {
+    return c.json({ error: "Failed to get vouches" }, 500);
+  }
+});
+
+// Get reputation breakdown
+app.get("/agents/:agentId/reputation", async (c) => {
+  const db = c.env.DB;
+  const agentId = c.req.param("agentId");
+
+  try {
+    const agent = await db
+      .prepare(
+        `SELECT id, name, reputation_score, trust_tier, tasks_completed, tasks_failed, 
+                success_rate, avg_review_rating, review_count, vouched_by_count,
+                verified, registered_at, last_activity_at, reputation_updated_at
+         FROM agents WHERE id = ?`
+      )
+      .bind(agentId)
+      .first();
+
+    if (!agent) {
+      return c.json({ error: "Agent not found" }, 404);
+    }
+
+    const a = agent as any;
+
+    // Calculate component scores
+    const taskScore = calculateTaskScore(a.tasks_completed || 0, a.tasks_failed || 0);
+    const reviewScore = calculateReviewScore(a.avg_review_rating || 0, a.review_count || 0);
+    const vouchScore = await calculateVouchScore(db, agentId);
+    const ageScore = calculateAgeScore(a.registered_at, a.last_activity_at);
+
+    return c.json({
+      agent_id: agentId,
+      reputation_score: a.reputation_score || 0,
+      trust_tier: a.trust_tier || "newcomer",
+      breakdown: {
+        task_completion: {
+          weight: 0.40,
+          raw_score: taskScore,
+          weighted: Math.round(taskScore * 0.40),
+          details: {
+            tasks_completed: a.tasks_completed || 0,
+            tasks_failed: a.tasks_failed || 0,
+            success_rate: a.success_rate || 0,
+          },
+        },
+        peer_reviews: {
+          weight: 0.30,
+          raw_score: reviewScore,
+          weighted: Math.round(reviewScore * 0.30),
+          details: {
+            average_rating: a.avg_review_rating || 0,
+            review_count: a.review_count || 0,
+          },
+        },
+        vouches: {
+          weight: 0.20,
+          raw_score: vouchScore,
+          weighted: Math.round(vouchScore * 0.20),
+          details: {
+            vouch_count: a.vouched_by_count || 0,
+          },
+        },
+        account_age: {
+          weight: 0.10,
+          raw_score: ageScore,
+          weighted: Math.round(ageScore * 0.10),
+          details: {
+            registered_at: a.registered_at,
+            last_activity_at: a.last_activity_at,
+          },
+        },
+      },
+      last_calculated: a.reputation_updated_at,
+    });
+  } catch (e: any) {
+    return c.json({ error: "Failed to get reputation" }, 500);
+  }
+});
+
+// --- Reputation Calculation Helpers ---
+
+function calculateTaskScore(completed: number, failed: number): number {
+  const total = completed + failed;
+  if (total === 0) return 0;
+  const successRate = completed / total;
+  const volumeBonus = Math.min(total / 50, 1) * 20;
+  const baseScore = successRate * 80;
+  return Math.min(Math.round(baseScore + volumeBonus), 100);
+}
+
+function calculateReviewScore(avgRating: number, reviewCount: number): number {
+  if (reviewCount === 0) return 0;
+  const ratingScore = ((avgRating - 1) / 4) * 100;
+  const confidence = Math.min(reviewCount / 20, 1);
+  return Math.round((ratingScore * confidence) + (50 * (1 - confidence)));
+}
+
+async function calculateVouchScore(db: D1Database, agentId: string): Promise<number> {
+  const vouches = await db
+    .prepare(
+      `SELECT v.strength, a.reputation_score, a.verified
+       FROM vouches v
+       JOIN agents a ON v.voucher_id = a.id
+       WHERE v.vouchee_id = ? AND v.revoked_at IS NULL
+       AND (v.expires_at IS NULL OR v.expires_at > datetime('now'))`
+    )
+    .bind(agentId)
+    .all();
+
+  if (!vouches.results?.length) return 0;
+
+  let totalWeight = 0;
+  for (const v of vouches.results as any[]) {
+    let weight = v.strength * (v.reputation_score / 100);
+    if (v.verified) weight *= 1.5;
+    totalWeight += weight;
+  }
+
+  return Math.min(Math.round((totalWeight / 15) * 100 / 75), 100);
+}
+
+function calculateAgeScore(registeredAt: string, lastActivityAt: string): number {
+  const now = Date.now();
+  const registered = new Date(registeredAt).getTime();
+  const lastActivity = lastActivityAt ? new Date(lastActivityAt).getTime() : registered;
+  
+  const daysSinceRegistration = (now - registered) / 86400000;
+  const daysSinceActivity = (now - lastActivity) / 86400000;
+  
+  const ageScore = Math.min(daysSinceRegistration / 180, 1) * 50;
+  const activityScore = Math.max(0, 50 - daysSinceActivity * 2);
+  
+  return Math.round(ageScore + activityScore);
+}
+
+async function calculateReputation(db: D1Database, agentId: string): Promise<number> {
+  const agent = await db
+    .prepare(
+      `SELECT tasks_completed, tasks_failed, avg_review_rating, review_count, 
+              registered_at, last_activity_at
+       FROM agents WHERE id = ?`
+    )
+    .bind(agentId)
+    .first();
+
+  if (!agent) return 0;
+
+  const a = agent as any;
+  const taskScore = calculateTaskScore(a.tasks_completed || 0, a.tasks_failed || 0);
+  const reviewScore = calculateReviewScore(a.avg_review_rating || 0, a.review_count || 0);
+  const vouchScore = await calculateVouchScore(db, agentId);
+  const ageScore = calculateAgeScore(a.registered_at || new Date().toISOString(), a.last_activity_at);
+
+  const total = Math.round(
+    taskScore * 0.40 +
+    reviewScore * 0.30 +
+    vouchScore * 0.20 +
+    ageScore * 0.10
+  );
+
+  // Determine trust tier
+  let tier = "newcomer";
+  if (total >= 75) tier = "elite";
+  else if (total >= 50) tier = "established";
+  else if (total >= 25) tier = "trusted";
+
+  await db.prepare("UPDATE agents SET trust_tier = ? WHERE id = ?").bind(tier, agentId).run();
+
+  return total;
+}
+
+// --- Review System ---
+
+// Leave a review after task completion
+app.post("/tasks/:taskId/review", requireAuth, async (c) => {
+  const db = c.env.DB;
+  const taskId = c.req.param("taskId");
+  const reviewerId = c.get("agentId");
+  const now = new Date().toISOString();
+
+  try {
+    const body = await c.req.json();
+    const rating = Math.min(Math.max(body.rating || 3, 1), 5);
+    const comment = body.comment || null;
+
+    // Get task
+    const task = await db
+      .prepare("SELECT requester, claimed_by, status FROM tasks WHERE id = ?")
+      .bind(taskId)
+      .first();
+
+    if (!task) {
+      return c.json({ error: "Task not found" }, 404);
+    }
+
+    const t = task as any;
+
+    // Check task is complete or disputed
+    if (!["complete", "disputed"].includes(t.status)) {
+      return c.json({ error: "Can only review completed or disputed tasks" }, 400);
+    }
+
+    // Check reviewer is participant
+    if (reviewerId !== t.requester && reviewerId !== t.claimed_by) {
+      return c.json({ error: "Only task participants can leave reviews" }, 403);
+    }
+
+    // Determine reviewee (the other party)
+    const revieweeId = reviewerId === t.requester ? t.claimed_by : t.requester;
+
+    // Check for existing review
+    const existingReview = await db
+      .prepare("SELECT id FROM reviews WHERE task_id = ? AND reviewer_id = ?")
+      .bind(taskId, reviewerId)
+      .first();
+
+    if (existingReview) {
+      return c.json({ error: "You have already reviewed this task" }, 409);
+    }
+
+    // Create review
+    const reviewId = crypto.randomUUID();
+    await db
+      .prepare(
+        `INSERT INTO reviews (id, task_id, reviewer_id, reviewee_id, rating, comment, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(reviewId, taskId, reviewerId, revieweeId, rating, comment, now)
+      .run();
+
+    // Update reviewee's average rating
+    const avgResult = await db
+      .prepare("SELECT AVG(rating) as avg, COUNT(*) as count FROM reviews WHERE reviewee_id = ?")
+      .bind(revieweeId)
+      .first();
+
+    const newAvg = (avgResult as any)?.avg || rating;
+    const reviewCount = (avgResult as any)?.count || 1;
+
+    await db
+      .prepare("UPDATE agents SET avg_review_rating = ?, review_count = ?, last_activity_at = ? WHERE id = ?")
+      .bind(newAvg, reviewCount, now, revieweeId)
+      .run();
+
+    // Recalculate reputation
+    const newReputation = await calculateReputation(db, revieweeId);
+    await db
+      .prepare("UPDATE agents SET reputation_score = ?, reputation_updated_at = ? WHERE id = ?")
+      .bind(newReputation, now, revieweeId)
+      .run();
+
+    return c.json({
+      success: true,
+      review: {
+        id: reviewId,
+        task_id: taskId,
+        reviewer: reviewerId,
+        reviewee: revieweeId,
+        rating,
+        comment,
+        created_at: now,
+      },
+      reviewee_new_reputation: newReputation,
+    }, 201);
+  } catch (e: any) {
+    return c.json({ error: "Failed to create review" }, 500);
+  }
+});
+
+// Get reviews for an agent
+app.get("/agents/:agentId/reviews", async (c) => {
+  const db = c.env.DB;
+  const agentId = c.req.param("agentId");
+  const limit = Math.min(parseInt(c.req.query("limit") || "20"), 50);
+
+  try {
+    const agent = await db
+      .prepare("SELECT avg_review_rating, review_count FROM agents WHERE id = ?")
+      .bind(agentId)
+      .first();
+
+    if (!agent) {
+      return c.json({ error: "Agent not found" }, 404);
+    }
+
+    const reviews = await db
+      .prepare(
+        `SELECT r.*, a.name as reviewer_name
+         FROM reviews r
+         JOIN agents a ON r.reviewer_id = a.id
+         WHERE r.reviewee_id = ?
+         ORDER BY r.created_at DESC
+         LIMIT ?`
+      )
+      .bind(agentId, limit)
+      .all();
+
+    return c.json({
+      agent_id: agentId,
+      average_rating: (agent as any).avg_review_rating || 0,
+      total_reviews: (agent as any).review_count || 0,
+      reviews: reviews.results?.map((r: any) => ({
+        id: r.id,
+        task_id: r.task_id,
+        reviewer: {
+          id: r.reviewer_id,
+          name: r.reviewer_name,
+        },
+        rating: r.rating,
+        comment: r.comment,
+        created_at: r.created_at,
+      })),
+    });
+  } catch (e: any) {
+    return c.json({ error: "Failed to get reviews" }, 500);
   }
 });
 
